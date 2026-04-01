@@ -50,19 +50,28 @@ def _generate_schema_registry():
 
     return registry
 
-def _get_diff_from_upstream():
-    file_list = []
-
+def _get_upstream_changes():
+    """
+    Return the git diff changes list against upstream master.
+    Creates the upstream remote if needed.
+    """
     repo = Repo(f"{os.path.dirname(os.path.abspath(__file__))}/../")
-    commits_list = list(repo.iter_commits())
 
     if "upstream" not in repo.remotes:
         repo.create_remote("upstream", NETBOX_DT_LIBRARY_URL)
 
     upstream = repo.remotes.upstream
     upstream.fetch()
+
     changes = upstream.refs.master.commit.diff(repo.head)
     changes = changes + repo.index.diff("HEAD")
+
+    return changes
+
+def _get_diff_from_upstream():
+    file_list = []
+
+    changes = _get_upstream_changes()
 
     for path, schema in SCHEMAS:
         # Initialize the schema
@@ -105,6 +114,36 @@ def _get_image_files():
 
     return file_list
 
+def _get_module_image_files():
+    """
+    Return a list of (file_path, change_type) for changed module-image files.
+    Includes all change types so structural checks apply to renames too.
+    """
+    file_list = []
+    changes = _get_upstream_changes()
+
+    CHANGE_TYPE_LIST = ['A', 'R', 'M', 'T']
+
+    for change in changes:
+        if change.change_type in CHANGE_TYPE_LIST:
+            for candidate in (change.rename_from, change.rename_to, change.a_path, change.b_path):
+                if candidate and candidate.startswith('module-images/') and os.path.isfile(candidate):
+                    entry = (candidate, change.change_type)
+                    if entry not in file_list:
+                        file_list.append(entry)
+                    break
+
+    return file_list
+
+def _get_all_module_image_files():
+    """
+    Return all module-image files for full validation (EVALUATE_ALL mode).
+    """
+    file_list = []
+    for file in sorted(glob.glob(f"module-images{os.path.sep}*{os.path.sep}*{os.path.sep}*")):
+        file_list.append((file, 'skip'))
+    return file_list
+
 def _decimal_file_handler(uri):
     """
     Handler to work with floating decimals that fail normal validation.
@@ -130,6 +169,13 @@ if USE_UPSTREAM_DIFF and not EVALUATE_ALL:
 else:
     definition_files = _get_definition_files()
 image_files = _get_image_files()
+
+if USE_UPSTREAM_DIFF and not EVALUATE_ALL:
+    module_image_files = _get_module_image_files()
+elif EVALUATE_ALL:
+    module_image_files = _get_all_module_image_files()
+else:
+    module_image_files = []
 
 if USE_LOCAL_KNOWN_SLUGS:
     KNOWN_SLUGS = pickle_operations.read_pickle_data(f'{ROOT_DIR}/tests/known-slugs.pickle')
@@ -296,3 +342,66 @@ def test_definitions(file_path, schema, change_type):
             if not rear_image:
                 pytest.fail(f'{file_path} has rear_image set to True but no matching image found (looking for \'elevation-images{os.path.sep}{file_path.split(os.path.sep)[1]}{os.path.sep}{this_device.get_slug()}.rear.ext\' but only found {manufacturer_images})', False)
     iterdict(definition)
+
+@pytest.mark.parametrize(('file_path', 'change_type'), module_image_files)
+def test_module_images(file_path, change_type):
+    """
+    Validate module-image files: structure, naming, module-type existence, and image count.
+
+    Checks are tiered by change type:
+    - Structure, extension, and image count: enforced on ALL changes
+    - YAML existence and naming convention: enforced only on new additions ('A')
+
+    Pre-existing images that predate these conventions are grandfathered for
+    naming and YAML requirements but must still follow structural rules.
+    """
+    parts = file_path.split(os.path.sep)
+
+    # Must follow module-images/<manufacturer>/<module-type>/<image> structure
+    if len(parts) != 4:
+        pytest.fail(
+            f"Invalid module-image path: {file_path}. "
+            f"Expected: module-images/<manufacturer>/<module-type>/<filename>",
+            pytrace=False,
+        )
+
+    manufacturer, module_name, image_file = parts[1], parts[2], parts[3]
+
+    # Valid image extension
+    ext = image_file.rsplit('.', 1)[-1].lower()
+    if ext not in IMAGE_FILETYPES:
+        pytest.fail(f"Invalid image file extension in {file_path}", pytrace=False)
+
+    # Maximum 2 images per module
+    module_dir = os.path.join('module-images', manufacturer, module_name)
+    if os.path.isdir(module_dir):
+        images = [f for f in os.listdir(module_dir) if not f.startswith('.')]
+        if len(images) > 2:
+            pytest.fail(
+                f"Maximum 2 images per module type. "
+                f"Found {len(images)} in {module_dir}: {images}",
+                pytrace=False,
+            )
+
+    # Strict checks below apply only to newly added images.
+    # Pre-existing images are grandfathered for naming and YAML requirements.
+    if change_type != 'A':
+        return
+
+    # Corresponding module-type YAML must exist
+    yaml_path = os.path.join('module-types', manufacturer, f'{module_name}.yaml')
+    yml_path = os.path.join('module-types', manufacturer, f'{module_name}.yml')
+    if not (os.path.isfile(yaml_path) or os.path.isfile(yml_path)):
+        pytest.fail(
+            f"No module-type definition found for {file_path}. Expected: {yaml_path}",
+            pytrace=False,
+        )
+
+    # Filename must start with module-type name: <module-type>[.<qualifier>].<ext>
+    name_stem = image_file.split('.')[0]
+    if name_stem != module_name:
+        pytest.fail(
+            f"Module image filename must start with '{module_name}': got '{image_file}'. "
+            f"Expected pattern: {module_name}[.<qualifier>].<ext>",
+            pytrace=False,
+        )
